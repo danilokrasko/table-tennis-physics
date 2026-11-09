@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Table Tennis Physics</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,400;0,700;0,900;1,900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.3/build/mp4-muxer.js"></script>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<style>
+  body { margin:0; background:#0a0b0e; color:#eee; font-family:Inter,system-ui,sans-serif; }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:12px 16px; position:sticky; top:0; background:#0a0b0e; z-index:1; }
+  button { font:inherit; font-size:14px; padding:8px 12px; border-radius:6px; border:none; background:#ff3c00; color:#fff; cursor:pointer; font-weight:700; }
+  button:disabled { opacity:.5; cursor:default; }
+  #status { font-size:13px; opacity:.8; }
+  canvas { width:100%; max-width:432px; display:block; margin:0 auto 24px; }
+  #lab { max-width:640px; margin:0 auto 48px; padding:0 16px; }
+  #lab h2 { font-size:22px; margin:8px 0; }
+  #lab p { font-size:14px; line-height:1.5; opacity:.8; margin:0 0 12px; }
+  #lab .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:12px; }
+  #lab select { font:inherit; font-size:14px; padding:8px; border-radius:6px; border:1px solid #333; background:#15171c; color:#eee; }
+  #lab input[type=range] { flex:1; min-width:160px; accent-color:#ff3c00; }
+  #lab canvas { max-width:640px; margin:0 auto 8px; background:#10131a; border-radius:8px; }
+  #li { font:13px/1.6 'JetBrains Mono', Consolas, monospace; white-space:pre-wrap; margin:8px 0 0; }
+</style>
+</head>
+<body>
+<div class="bar"><button id="play">Play</button><button id="rec" disabled>Render MP4 (15s)</button><span id="status">loading…</span></div>
+<canvas id="out" width="1080" height="1350"></canvas>
+<section id="lab">
+  <h2>Spin lab</h2>
+  <p>Same physics as the video: gravity, air drag and the Magnus force. One serve, same launch speed every time. Pick a spin and see where the ball goes. The dashed line is the same serve with no spin.</p>
+  <div class="row"><select id="lk"><option value="side">Sidespin</option><option value="top">Topspin</option><option value="back">Backspin</option></select><input id="lr" type="range" min="0" max="5000" step="100" value="2600"><b id="lv"></b></div>
+  <canvas id="ltop" width="800" height="400"></canvas>
+  <canvas id="lside" width="800" height="200"></canvas>
+  <pre id="li"></pre>
+</section>
+<script type="module">
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+const W = 1080, H = 1350;
+const out = document.getElementById('out'), ctx = out.getContext('2d');
+const SANS = "Inter, system-ui, sans-serif", MONO = "'JetBrains Mono', Consolas, monospace";
+const V = (x, y, z) => new THREE.Vector3(x, y, z);
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+
+// ---------- renderer ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1); renderer.setSize(W, H, false);
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.0; renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x07080b); scene.fog = new THREE.FogExp2(0x07080b, 0.05);
+const pmrem = new THREE.PMREMGenerator(renderer); scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.02).texture; scene.environmentIntensity = 0.35;
+const camera = new THREE.PerspectiveCamera(42, W / H, 0.02, 80); scene.add(camera);
+const phys = (c, r, extra = {}) => new THREE.MeshPhysicalMaterial({ color: c, roughness: r, metalness: 0, clearcoat: 0.8, clearcoatRoughness: 0.1, ...extra });
+const std = (c, r, m, extra = {}) => new THREE.MeshStandardMaterial({ color: c, roughness: r, metalness: m, ...extra });
+const M = {
+  white: phys(0xd9d5cf, 0.34), ora: phys(0xff3c00, 0.32), red: phys(0xb80018, 0.34), gra: std(0x2a2e35, 0.45, 0.55), steel: std(0xc6cbd2, 0.24, 1), chrome: std(0xe6e9ee, 0.08, 1), blk: std(0x111317, 0.6, 0.1),
+  visor: phys(0x050607, 0.03, { clearcoat: 1 }), led: new THREE.MeshStandardMaterial({ color: 0x300404, emissive: 0xff2018, emissiveIntensity: 9 }),
+  gloveR: phys(0xb3001c, 0.42, { sheen: 0.6, sheenRoughness: 0.4, sheenColor: new THREE.Color(0xff6060), clearcoat: 0.5, clearcoatRoughness: 0.25 }),
+  gloveO: phys(0xff4a10, 0.42, { sheen: 0.5, sheenRoughness: 0.4, sheenColor: new THREE.Color(0xffa070), clearcoat: 0.5, clearcoatRoughness: 0.25 }),
+  cuffW: phys(0xf2f0ec, 0.5, { clearcoat: 0.3 }), canvas: std(0xcfcac0, 0.85, 0), apron: std(0x1a1c21, 0.8, 0),
+  ropeR: phys(0xc8001c, 0.35), ropeW: phys(0xf0eee9, 0.35), pad: phys(0xff3c00, 0.4),
+  hoodie: std(0x3a3d44, 0.85, 0), hoodieD: std(0x2c2f35, 0.9, 0), pants: std(0x1f2126, 0.85, 0), skin: std(0xa8724e, 0.6, 0, { }), gear: phys(0xc4001a, 0.45, { clearcoat: 0.4 }), hair: std(0x14110f, 0.8, 0), lip: std(0x6e3f2c, 0.6, 0), mouth: phys(0xf2f0ec, 0.3, { clearcoat: 0.6 }), shoe: phys(0xff4a10, 0.5, { clearcoat: 0.3 }), sole: std(0xf2f0ec, 0.7, 0),
+};
+const cyl = (r0, r1, h, s = 32) => new THREE.CylinderGeometry(r0, r1, h, s), rb = (a, b, c, r = 0.01) => new RoundedBoxGeometry(a, b, c, 3, Math.min(r, Math.min(a, b, c) * 0.49));
+const cap = (r, len) => new THREE.CapsuleGeometry(r, Math.max(0.001, len), 8, 20).translate(0, len / 2, 0);
+const T = (g, x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0) => { g.rotateX(rx); g.rotateY(ry); g.rotateZ(rz); g.translate(x, y, z); return g; };
+let N_PARTS = 0;
+const rivet = (x, y, z, r = 0.005) => T(new THREE.SphereGeometry(r, 8, 6), x, y, z);
+function build(list) {
+  const mats = [], buckets = [];
+  for (const [g, m] of list) { let i = mats.indexOf(m); if (i < 0) { mats.push(m); buckets.push([]); i = mats.length - 1; } const n = g.index ? g.toNonIndexed() : g; if (!n.attributes.uv) n.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array(n.attributes.position.count * 2), 2)); for (const k of Object.keys(n.attributes)) if (!['position', 'normal', 'uv'].includes(k)) n.deleteAttribute(k); buckets[i].push(n); }
+  const merged = buckets.map(b => b.length > 1 ? mergeGeometries(b) : b[0]);
+  return mats.length === 1 ? [merged[0], mats[0]] : [mergeGeometries(merged, true), mats];
+}
+function add(parent, list, x = 0, y = 0, z = 0, rot) { const [g, m] = build(list); const mesh = new THREE.Mesh(g, m); mesh.position.set(x, y, z); if (rot) mesh.rotation.set(...rot); mesh.castShadow = mesh.receiveShadow = true; parent.add(mesh); N_PARTS++; return mesh; }
+const rv = (pts, r) => pts.map(p => [rivet(...p, r), M.steel]);
+let rs = 11; const rnd = () => (rs = (rs * 16807) % 2147483647, (rs - 1) / 2147483646);
+
+// ===================== ARENA: dark blue, glowing table (ref 1), broadcast camera behind the near player (ref 3) =====================
+scene.background = new THREE.Color(0x030716); scene.fog = new THREE.FogExp2(0x030716, 0.035); scene.environmentIntensity = 0.45;
+Object.assign(M, {
+  shirt: std(0xe2401a, 0.75, 0), shirtD: std(0xa82a0e, 0.8, 0), shorts: std(0x141a2e, 0.8, 0), sock: std(0xf2f0ec, 0.8, 0),
+  tableTop: phys(0x1747c9, 0.3, { clearcoat: 1, clearcoatRoughness: 0.08 }), line: std(0xf4f6fb, 0.5, 0), leg: std(0x0b0e16, 0.5, 0.6),
+  glow: new THREE.MeshStandardMaterial({ color: 0x0a2a60, emissive: 0x3fa9ff, emissiveIntensity: 7 }),
+  net: new THREE.MeshStandardMaterial({ color: 0x0a0d14, transparent: true, opacity: 0.6, roughness: 0.8, side: THREE.DoubleSide }),
+  floor: phys(0x040a1c, 0.55, { clearcoat: 0.35, clearcoatRoughness: 0.25 }),
+  wood: std(0xc89a62, 0.6, 0), rubR: std(0xc0101a, 0.65, 0), rubB: std(0x101010, 0.7, 0),
+  ballM: new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xfff0d0, emissiveIntensity: 1.5, roughness: 0.4 }),
+});
+const TL = 1.37, TW = 0.7625, TH = 0.76;
+add(scene, [[T(new THREE.BoxGeometry(40, 0.02, 40), 0, -0.01, 0), M.floor]]);
+const ln = (sx, sz, x, z) => [T(new THREE.BoxGeometry(sx, 0.002, sz), x, TH + 0.001, z), M.line];
+add(scene, [[T(rb(2 * TL, 0.03, 2 * TW, 0.006), 0, TH - 0.015, 0), M.tableTop], ln(2 * TL, 0.02, 0, TW - 0.01), ln(2 * TL, 0.02, 0, -TW + 0.01), ln(0.02, 2 * TW, TL - 0.01, 0), ln(0.02, 2 * TW, -TL + 0.01, 0), ln(2 * TL, 0.004, 0, 0),
+  ...[[1, 1], [1, -1], [-1, 1], [-1, -1]].map(([a, b]) => [T(rb(0.05, TH - 0.03, 0.05, 0.01), a * (TL - 0.25), (TH - 0.03) / 2, b * (TW - 0.2)), M.leg]), [T(rb(2 * TL - 0.4, 0.05, 0.05, 0.01), 0, 0.14, 0), M.leg]]);
+add(scene, [[T(new THREE.BoxGeometry(2 * TL + 0.01, 0.008, 0.008), 0, TH - 0.034, TW), M.glow], [T(new THREE.BoxGeometry(2 * TL + 0.01, 0.008, 0.008), 0, TH - 0.034, -TW), M.glow], [T(new THREE.BoxGeometry(0.008, 0.008, 2 * TW), TL, TH - 0.034, 0), M.glow], [T(new THREE.BoxGeometry(0.008, 0.008, 2 * TW), -TL, TH - 0.034, 0), M.glow]]);
+add(scene, [[T(new THREE.PlaneGeometry(2 * TW + 0.3, 0.1525), 0, TH + 0.076, 0, 0, Math.PI / 2, 0), M.net], [T(new THREE.BoxGeometry(0.006, 0.014, 2 * TW + 0.3), 0, TH + 0.152, 0), M.line],
+  [T(cyl(0.01, 0.01, 0.16, 12), 0, TH + 0.08, TW + 0.15), M.leg], [T(cyl(0.01, 0.01, 0.16, 12), 0, TH + 0.08, -TW - 0.15), M.leg]]);
+function textTex(draw, w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; draw(c.getContext('2d'), w, h); const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8; return t; }
+function buildBoards() {
+  const tex = textTex((x, w, h) => { const g = x.createLinearGradient(0, 0, w, 0); g.addColorStop(0, '#0a2370'); g.addColorStop(0.5, '#1442c4'); g.addColorStop(1, '#0a2370'); x.fillStyle = g; x.fillRect(0, 0, w, h);
+    x.font = 'italic 900 70px Inter, sans-serif'; x.textBaseline = 'middle'; x.fillStyle = '#ffffff'; x.fillText('TABLE TENNIS', 40, h / 2 + 4); x.fillStyle = '#ff5a20'; x.fillText('PART 3', 640, h / 2 + 4); }, 1024, 128);
+  const mat = new THREE.MeshStandardMaterial({ map: tex, emissiveMap: tex, emissive: 0xffffff, emissiveIntensity: 0.55, roughness: 0.6 });
+  const board = (x, z, ry) => { const m = new THREE.Mesh(new THREE.PlaneGeometry(2.4, 0.3), mat); m.position.set(x, 0.36, z); m.rotation.y = ry; scene.add(m); const b = new THREE.Mesh(new THREE.BoxGeometry(2.42, 0.72, 0.04), M.leg); b.position.set(x, 0.36, z); b.rotation.y = ry; b.translateZ(-0.025); scene.add(b); };
+  for (const z of [-2.4, 0, 2.4]) board(5.2, z, -Math.PI / 2);
+  for (const x of [-3.6, -1.2, 1.2, 3.6]) { board(x, 3.4, Math.PI); board(x, -3.4, 0); }
+  const back = FOXIK_BACK; back.material.map = textTex((x, w, h) => { x.clearRect(0, 0, w, h); x.font = 'italic 900 96px Inter, sans-serif'; x.textAlign = 'center'; x.fillStyle = '#ffffff'; x.fillText('FOXIK', w / 2, 120); x.font = 'italic 900 240px Inter, sans-serif'; x.fillText('9', w / 2, 360); }, 512, 400); back.material.needsUpdate = true;
+}
+// light-streak backdrop like ref 1
+const streak = textTex((x, w, h) => { const g = x.createRadialGradient(w / 2, h * 0.55, 10, w / 2, h * 0.55, w * 0.6); g.addColorStop(0, '#2a6dff'); g.addColorStop(0.35, '#0b2a8a'); g.addColorStop(1, '#020512'); x.fillStyle = g; x.fillRect(0, 0, w, h);
+  x.globalCompositeOperation = 'lighter'; let s = 5; const r = () => (s = (s * 16807) % 2147483647, (s - 1) / 2147483646);
+  for (let k = 0; k < 220; k++) { const a = r() * Math.PI * 2, r0 = 60 + r() * 200, r1 = r0 + 200 + r() * 700, c = r() < 0.12 ? '255,70,40' : r() < 0.5 ? '120,200,255' : '60,120,255'; x.strokeStyle = `rgba(${c},${0.08 + r() * 0.35})`; x.lineWidth = 1 + r() * 5; x.beginPath(); x.moveTo(w / 2 + Math.cos(a) * r0, h * 0.55 + Math.sin(a) * r0 * 0.6); x.lineTo(w / 2 + Math.cos(a) * r1, h * 0.55 + Math.sin(a) * r1 * 0.6); x.stroke(); } }, 2048, 1024);
+const bd = new THREE.Mesh(new THREE.PlaneGeometry(36, 18), new THREE.MeshBasicMaterial({ map: streak, fog: false })); bd.position.set(12, 5, 0); bd.rotation.y = -Math.PI / 2; scene.add(bd);
+for (const sz of [1, -1]) { const sd = new THREE.Mesh(new THREE.PlaneGeometry(30, 14), new THREE.MeshBasicMaterial({ map: streak, fog: false, transparent: true, opacity: 0.5 })); sd.position.set(3, 4, sz * 9); sd.rotation.y = sz > 0 ? Math.PI : 0; scene.add(sd); }
+const bokehMat = c => new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.85, fog: false });
+for (let k = 0; k < 320; k++) { const side = rnd(); let x, z; if (side < 0.5) { x = 6.5 + rnd() * 3; z = (rnd() - 0.5) * 12; } else { x = -2 + rnd() * 10; z = (rnd() < 0.5 ? -1 : 1) * (4.5 + rnd() * 3); }
+  const m = new THREE.Mesh(new THREE.SphereGeometry(0.03 + rnd() * 0.05, 8, 6), bokehMat(rnd() < 0.15 ? 0xff5a20 : rnd() < 0.5 ? 0xe8f0ff : 0x5f9bff)); m.position.set(x, 0.9 + rnd() * 4, z); scene.add(m); }
+scene.add(new THREE.HemisphereLight(0x6f8cff, 0x05060a, 0.4));
+const top = new THREE.SpotLight(0xf4f6ff, 46, 14, 0.75, 0.5, 1.5); top.position.set(0, 6.5, 0.3); top.target.position.set(0, 0.7, 0); top.castShadow = true; top.shadow.mapSize.set(4096, 4096); top.shadow.bias = -0.0002; top.shadow.radius = 3; scene.add(top, top.target);
+const rimB = new THREE.SpotLight(0x5fa0ff, 40, 14, 0.5, 0.7, 1.5); rimB.position.set(5, 3.4, 3); rimB.target.position.set(-1.5, 1.1, 0); scene.add(rimB, rimB.target);
+const rimB2 = new THREE.SpotLight(0x5fa0ff, 30, 14, 0.5, 0.7, 1.5); rimB2.position.set(-5, 3.4, -3); rimB2.target.position.set(2, 1.1, 0); scene.add(rimB2, rimB2.target);
+const rimR = new THREE.SpotLight(0xff4a20, 34, 14, 0.5, 0.7, 1.5); rimR.position.set(4.5, 3.6, -3.5); rimR.target.position.set(2, 1.1, 0); scene.add(rimR, rimR.target);
+const fill = new THREE.SpotLight(0xffeedd, 14, 12, 0.5, 0.8, 1.5); fill.position.set(-6, 3, 1.2); fill.target.position.set(-1.8, 1.1, 0); scene.add(fill, fill.target);
+const BALL = new THREE.Mesh(new THREE.SphereGeometry(0.02 * 1.4, 20, 14), M.ballM); BALL.castShadow = true; scene.add(BALL);
+
+// ===================== PLAYER RIG (from the boxing rig, gloves swapped for hands + paddle) =====================
+const A_UP = 0.29, A_LO = 0.35, L_TH = 0.45, L_SH = 0.45;
+function ik(S0, Tg, pole, l1, l2) {
+  const d = Tg.clone().sub(S0), len = clamp(d.length(), 0.05, l1 + l2 - 0.002), dir = d.normalize(), a = (l1 * l1 + len * len - l2 * l2) / (2 * len), h = Math.sqrt(Math.max(0, l1 * l1 - a * a));
+  const perp = pole.clone().sub(S0); perp.addScaledVector(dir, -perp.dot(dir)).normalize();
+  return { E: S0.clone().addScaledVector(dir, a).addScaledVector(perp, h), Wr: S0.clone().addScaledVector(dir, len) };
+}
+const Y = V(0, 1, 0);
+function orient(g, a, b) { g.position.copy(a); g.quaternion.setFromUnitVectors(Y, b.clone().sub(a).normalize()); }
+const paddleList = () => [[T(cyl(0.014, 0.017, 0.1, 16), 0, 0.07, 0), M.wood], [T(cyl(0.078, 0.078, 0.006, 40), 0, 0.2, 0, Math.PI / 2), M.wood],
+  [T(cyl(0.077, 0.077, 0.003, 40), 0, 0.2, 0.0045, Math.PI / 2), M.rubR], [T(cyl(0.077, 0.077, 0.003, 40), 0, 0.2, -0.0045, Math.PI / 2), M.rubB]];
+let FOXIK_BACK;
+function makePlayer(kind) {
+  const F = { kind, root: new THREE.Group() }; scene.add(F.root);
+  F.pelvis = new THREE.Group(); F.root.add(F.pelvis);
+  F.chest = new THREE.Group(); F.chest.position.set(0, 0.1, 0); F.chest.rotation.order = 'YZX'; F.pelvis.add(F.chest);
+  F.head = new THREE.Group(); F.chest.add(F.head); F.limbs = {};
+  const seg = (name, list) => { const g = new THREE.Group(); scene.add(g); add(g, list); F.limbs[name] = g; return g; };
+  if (kind === 'human') {
+    add(F.pelvis, [[rb(0.22, 0.2, 0.34, 0.08), M.shorts]]);
+    const torso = new THREE.SphereGeometry(1, 40, 28); torso.scale(0.115, 0.27, 0.185);
+    const belly = new THREE.SphereGeometry(1, 36, 24); belly.scale(0.1, 0.16, 0.16);
+    add(F.chest, [[T(torso, 0, 0.3, 0), M.shirt], [T(belly, 0, 0.12, 0), M.shirt], [T(new THREE.SphereGeometry(0.07, 24, 16), 0, 0.47, 0.17), M.shirt], [T(new THREE.SphereGeometry(0.07, 24, 16), 0, 0.47, -0.17), M.shirt],
+      [T(new THREE.TorusGeometry(0.055, 0.012, 10, 28), 0, 0.53, 0, Math.PI / 2), M.shirtD], [T(rb(0.012, 0.3, 0.02, 0.006), 0, 0.3, 0.183), M.line], [T(rb(0.012, 0.3, 0.02, 0.006), 0, 0.3, -0.183), M.line]]);
+    FOXIK_BACK = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.234), new THREE.MeshStandardMaterial({ transparent: true, roughness: 0.8 })); FOXIK_BACK.position.set(-0.118, 0.32, 0); FOXIK_BACK.rotation.y = -Math.PI / 2; F.chest.add(FOXIK_BACK);
+    add(F.head, [[T(cyl(0.05, 0.055, 0.1, 20), 0, -0.02, 0), M.skin], [T(new THREE.SphereGeometry(0.1, 32, 24).scale(1, 1.12, 0.92), 0, 0.12, 0), M.skin],
+      [T(new THREE.SphereGeometry(0.106, 32, 20, 0, Math.PI * 2, 0, Math.PI * 0.5).scale(1.03, 1.0, 0.96), -0.008, 0.145, 0, 0, 0, 0.32), M.hair], [T(new THREE.SphereGeometry(0.104, 28, 16, 0, Math.PI * 2, Math.PI * 0.5, Math.PI * 0.18).scale(1.02, 1.12, 0.95), -0.025, 0.14, 0, 0, 0, 0.32), M.hair],
+      [T(new THREE.SphereGeometry(0.022, 14, 10).scale(0.5, 1, 0.8), 0.0, 0.12, 0.1), M.skin], [T(new THREE.SphereGeometry(0.022, 14, 10).scale(0.5, 1, 0.8), 0.0, 0.12, -0.1), M.skin],
+      [T(new THREE.SphereGeometry(0.018, 12, 10), 0.1, 0.12, 0), M.skin], [T(rb(0.012, 0.012, 0.03, 0.005), 0.095, 0.155, 0.035), M.blk], [T(rb(0.012, 0.012, 0.03, 0.005), 0.095, 0.155, -0.035), M.blk],
+      [T(rb(0.008, 0.008, 0.035, 0.003), 0.098, 0.172, 0.035), M.hair], [T(rb(0.008, 0.008, 0.035, 0.003), 0.098, 0.172, -0.035), M.hair], [T(rb(0.006, 0.006, 0.04, 0.003), 0.096, 0.075, 0), M.lip]]);
+    F.head.position.set(0.02, 0.55, 0);
+    for (const sd of [1, -1]) {
+      seg('ua' + sd, [[cap(0.05, A_UP - 0.05), M.skin], [T(cyl(0.066, 0.06, 0.14, 20), 0, 0.05, 0), M.shirt]]); seg('la' + sd, [[cap(0.044, A_LO - 0.1), M.skin], [T(cyl(0.048, 0.048, 0.04, 20), 0, A_LO - 0.08, 0), M.sock]]);
+      seg('th' + sd, [[cap(0.074, L_TH - 0.04), M.skin], [T(cyl(0.095, 0.088, 0.25, 22), 0, 0.1, 0), M.shorts]]); seg('sh' + sd, [[cap(0.058, L_SH - 0.05), M.skin], [T(cyl(0.062, 0.058, 0.13, 20), 0, L_SH - 0.11, 0), M.sock]]);
+      F['gl' + sd] = add(scene, [[new THREE.SphereGeometry(0.042, 20, 14).scale(1, 1.25, 0.8), M.skin]]);
+      F['ft' + sd] = add(scene, [[T(rb(0.27, 0.09, 0.11, 0.04), 0.06, 0.03, 0), M.shoe], [T(rb(0.28, 0.025, 0.115, 0.01), 0.06, -0.01, 0), M.sole], [T(rb(0.08, 0.01, 0.1, 0.004), 0.1, 0.078, 0), M.cuffW]]);
+    }
+  } else {
+    add(F.pelvis, [[rb(0.22, 0.16, 0.34, 0.04), M.gra], [T(rb(0.24, 0.04, 0.36, 0.015), 0, 0.09, 0), M.ora], ...rv([[0.11, 0, 0.16], [0.11, 0, -0.16]], 0.006)]);
+    const ch = [];
+    for (let k = 0; k < 4; k++) ch.push([T(cyl(0.13 - k * 0.006, 0.135 - k * 0.006, 0.035, 28), 0, 0.03 + k * 0.042, 0), k % 2 ? M.steel : M.gra]);
+    ch.push([T(rb(0.27, 0.32, 0.46, 0.07), 0, 0.36, 0), M.white], [T(rb(0.275, 0.3, 0.08, 0.02), 0, 0.36, 0.2), M.ora], [T(rb(0.275, 0.3, 0.08, 0.02), 0, 0.36, -0.2), M.ora], [T(rb(0.02, 0.26, 0.05, 0.01), 0.13, 0.36, 0), M.red],
+      [T(cyl(0.04, 0.04, 0.012, 28), 0.139, 0.4, 0, 0, 0, Math.PI / 2), M.led], [T(new THREE.TorusGeometry(0.045, 0.007, 10, 32), 0.14, 0.4, 0, 0, Math.PI / 2, 0), M.steel],
+      ...[0.23, 0.27, 0.31].flatMap(y => [[T(rb(0.01, 0.008, 0.12, 0.003), 0.133, y, 0.12), M.blk], [T(rb(0.01, 0.008, 0.12, 0.003), 0.133, y, -0.12), M.blk]]),
+      ...rv([[0.12, 0.5, 0.2], [0.12, 0.5, -0.2], [0.12, 0.22, 0.2], [0.12, 0.22, -0.2], [0.13, 0.41, 0.21], [0.13, 0.41, -0.21]], 0.006), [T(cyl(0.05, 0.06, 0.08, 20), 0, 0.56, 0), M.gra]);
+    for (const sz of [0.2, -0.2]) ch.push([T(new THREE.SphereGeometry(0.075, 24, 16), 0, 0.48, sz), M.steel], [T(new THREE.SphereGeometry(0.095, 28, 14, 0, Math.PI * 2, 0, Math.PI / 2).scale(1, 0.8, 1), 0, 0.49, sz), M.white], [T(new THREE.TorusGeometry(0.093, 0.01, 10, 32), 0, 0.5, sz, Math.PI / 2), M.ora]);
+    add(F.chest, ch);
+    F.head.position.set(0.0, 0.66, 0);
+    add(F.head, [[T(rb(0.22, 0.2, 0.2, 0.06), 0, 0.08, 0), M.white], [T(rb(0.12, 0.08, 0.04, 0.015), 0, 0.07, 0.11), M.ora], [T(rb(0.12, 0.08, 0.04, 0.015), 0, 0.07, -0.11), M.ora], [T(rb(0.04, 0.03, 0.12, 0.01), 0.07, -0.02, 0), M.gra], ...rv([[0.04, 0.1, 0.13], [-0.02, 0.1, 0.13], [0.04, 0.1, -0.13], [-0.02, 0.1, -0.13]], 0.005)]);
+    add(F.head, [[rb(0.15, 0.06, 0.205, 0.02), M.visor], [T(rb(0.006, 0.008, 0.12, 0.003), 0.076, 0.002, 0), M.led]], 0.045, 0.09, 0);
+    add(F.head, [[rb(0.2, 0.12, 0.03, 0.012), M.red]], -0.01, 0.18, 0);
+    const armUp = len => [[T(cyl(0.05, 0.045, len * 0.9, 24), 0, len / 2, 0), M.white], [T(cyl(0.052, 0.052, 0.02, 24), 0, len * 0.2, 0), M.ora], [T(cyl(0.03, 0.03, len, 14), 0.045, len / 2, 0), M.gra], ...rv([[0, len * 0.5, 0.048]], 0.005)];
+    const armLo = len => [[T(cyl(0.042, 0.05, len * 0.85, 24), 0, len * 0.45, 0), M.white], [T(cyl(0.047, 0.047, 0.018, 24), 0, len * 0.75, 0), M.red], [T(cyl(0.012, 0.012, len * 0.7, 12), -0.045, len * 0.45, 0), M.chrome]];
+    for (const sd of [1, -1]) { seg('ua' + sd, armUp(A_UP)); seg('la' + sd, armLo(A_LO - 0.04)); F['el' + sd] = add(scene, [[new THREE.SphereGeometry(0.055, 20, 14), M.steel]]);
+      seg('th' + sd, [[T(cyl(0.07, 0.06, L_TH, 24), 0, L_TH / 2, 0), M.white], [T(cyl(0.072, 0.072, 0.02, 24), 0, L_TH * 0.8, 0), M.ora], [T(cyl(0.02, 0.02, L_TH * 0.7, 12), 0.06, L_TH / 2, 0), M.chrome]]);
+      seg('sh' + sd, [[T(cyl(0.05, 0.06, L_SH, 24), 0, L_SH / 2, 0), M.white], [T(cyl(0.062, 0.062, 0.018, 24), 0, L_SH * 0.75, 0), M.red]]); F['kn' + sd] = add(scene, [[new THREE.SphereGeometry(0.06, 20, 14), M.steel]]);
+      F['gl' + sd] = add(scene, [[new THREE.SphereGeometry(0.046, 20, 14).scale(1, 1.2, 0.85), M.steel], [T(rb(0.07, 0.03, 0.05, 0.01), 0, 0.035, 0), M.gra]]);
+      F['ft' + sd] = add(scene, [[T(rb(0.26, 0.08, 0.13, 0.03), 0.05, 0.02, 0), M.gra], [T(rb(0.265, 0.02, 0.135, 0.008), 0.05, -0.015, 0), M.red]]); }
+  }
+  F.paddle = add(F.gl1, paddleList());
+  return F;
+}
+function posePlayer(F, p) {
+  F.root.position.set(p.x, 0, p.z ?? 0); F.root.rotation.set(0, p.yaw, 0, 'XYZ');
+  F.pelvis.position.set(p.px ?? 0, p.hip ?? 0.84, p.pz ?? 0); F.pelvis.rotation.set(0, p.tp ?? -0.15, 0);
+  F.chest.rotation.set(p.side ?? 0, p.tc ?? -0.1, -(p.lean ?? 0.35));
+  F.head.rotation.set(p.hx ?? 0, p.hy ?? 0, p.hz ?? 0.25);
+  F.root.updateMatrixWorld(true);
+  const L = v => F.root.localToWorld(V(...v));
+  for (const sd of [1, -1]) {
+    const sh = F.chest.localToWorld(V(0.0, 0.5, sd * 0.2)), gl = L(sd > 0 ? p.gR : p.gL), pole = L([-(p.elbowBack ?? 0.25), (p.hip ?? 0.84) + 0.1, sd * 0.6]);
+    const a = ik(sh, gl, pole, A_UP, A_LO); orient(F.limbs['ua' + sd], sh, a.E); orient(F.limbs['la' + sd], a.E, a.Wr); if (F['el' + sd]) F['el' + sd].position.copy(a.E);
+    const g = F['gl' + sd]; g.position.copy(a.Wr); g.quaternion.setFromUnitVectors(Y, a.Wr.clone().sub(a.E).normalize()); if (sd > 0) { g.rotateY(p.roll ?? 0); g.rotateX(p.tilt ?? 0); }
+    if (sd > 0 && p.face && p.faceW > 0) { const Z = p.face.clone().normalize(), right = V(0, 0, 1).applyQuaternion(F.root.quaternion), Yh = a.Wr.clone().sub(a.E).normalize().multiplyScalar(0.4).add(right).add(V(0, -0.3, 0)).normalize(), Yv = Yh.addScaledVector(Z, -Yh.dot(Z)).normalize(), X = new THREE.Vector3().crossVectors(Yv, Z);
+      g.quaternion.slerp(new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(X, Yv, Z)), p.faceW); }
+    const hp = F.pelvis.localToWorld(V(0, -0.04, sd * 0.1)), ft = p.fw ? V(...p.fw[sd > 0 ? 0 : 1]) : L(sd > 0 ? p.fR : p.fL), kp = L([0.7, 0.5, sd * 0.35]);
+    const b = ik(hp, ft, kp, L_TH, L_SH); orient(F.limbs['th' + sd], hp, b.E); orient(F.limbs['sh' + sd], b.E, b.Wr); if (F['kn' + sd]) F['kn' + sd].position.copy(b.E);
+    const f = F['ft' + sd]; f.position.copy(b.Wr); f.quaternion.setFromEuler(new THREE.Euler(0, p.yaw + (sd > 0 ? (p.footR ?? 0.35) : (p.footL ?? 0.15)), 0, 'XYZ')); if (sd > 0 && p.heel) f.rotateZ(p.heel);
+  }
+  F.root.updateMatrixWorld(true); scene.updateMatrixWorld(true);
+}
+const ME = makePlayer('human'), BOT = makePlayer('robot');
+const paddleCenter = F => F.gl1.localToWorld(V(0, 0.2, 0));
+
+// ===================== BALL PHYSICS (1 kHz): gravity + air drag + Magnus force, bounces on table, floor and boards =====================
+const lerp = (a, b, k) => a + (b - a) * k, smooth = v => { v = clamp(v); return v * v * (3 - 2 * v); }, easeOut = v => { v = clamp(v); return 1 - Math.pow(1 - v, 3); };
+const RB = 0.02, MB = 0.0027, RHO = 1.2, AB = Math.PI * RB * RB, CD = 0.5, DT = 1 / 1000, KEEP = 2;
+const KD = 0.5 * RHO * AB * CD / MB, KM = 0.25 * RHO * AB * RB / MB; // Magnus with C_L = 0.5 * (r*omega / v)
+const RPM = 60 / (2 * Math.PI);
+function sim(p0, v0, w, o = {}) {
+  let [x, y, z] = p0, [vx, vy, vz] = v0, [wx, wy, wz] = w; const Tmax = o.T ?? 3, pts = [[x, y, z]], spin = [Math.hypot(wx, wy, wz)], bounces = []; let t = 0, n = 0, netOk = true;
+  while (t < Tmax) {
+    const sp = Math.hypot(vx, vy, vz);
+    const ax = -KD * sp * vx + KM * (wy * vz - wz * vy), ay = -KD * sp * vy + KM * (wz * vx - wx * vz) - 9.81, az = -KD * sp * vz + KM * (wx * vy - wy * vx);
+    const px = x; vx += ax * DT; vy += ay * DT; vz += az * DT; x += vx * DT; y += vy * DT; z += vz * DT; t += DT; n++;
+    if (px * x < 0 && y < TH + 0.1525 + RB && Math.abs(z) < TW + 0.15) netOk = false;
+    if (y < TH + RB && vy < 0 && y > TH - 0.04 && Math.abs(x) < TL && Math.abs(z) < TW) { y = TH + RB; vy = -0.9 * vy; vx *= 0.88; vz *= 0.88; wx *= 0.7; wy *= 0.7; wz *= 0.7; bounces.push({ t, p: [x, y, z] }); if (o.stopAfter && bounces.length >= o.stopAfter) break; }
+    if (y < RB && vy < 0) { y = RB; vy = -0.55 * vy; vx *= 0.7; vz *= 0.7; }
+    if (Math.abs(x) > 5.15 && vx * x > 0) vx = -0.3 * vx;
+    if (n % KEEP === 0) { pts.push([x, y, z]); spin.push(Math.hypot(wx, wy, wz)); }
+  }
+  const dtp = DT * KEEP;
+  const at = tt => { const f = clamp(tt / dtp, 0, pts.length - 1), i = Math.floor(f), j = Math.min(pts.length - 1, i + 1), u = f - i; return V(lerp(pts[i][0], pts[j][0], u), lerp(pts[i][1], pts[j][1], u), lerp(pts[i][2], pts[j][2], u)); };
+  const rpmAt = tt => spin[clamp(Math.round(tt / dtp), 0, spin.length - 1)] * RPM;
+  const speedAt = tt => at(tt + 0.002).distanceTo(at(tt)) / 0.002;
+  return { pts, spin, bounces, netOk, dtp, at, rpmAt, speedAt, end: (pts.length - 1) * dtp };
+}
+// grid search for the launch velocity that puts the bounces where the rally needs them
+function solve(p0, w, spec) {
+  let best = null; const R = r => Array.isArray(r) ? r : [r, r, 1];
+  const [x0, x1, xs] = R(spec.vx), [y0, y1, ys] = R(spec.vy), [z0, z1, zs] = R(spec.vz);
+  for (let vx = x0; vx <= x1 + 1e-9; vx += xs) for (let vy = y0; vy <= y1 + 1e-9; vy += ys) for (let vz = z0; vz <= z1 + 1e-9; vz += zs) {
+    const r = sim(p0, [vx, vy, vz], w, { T: spec.h ? 1.0 : 0.9, stopAfter: spec.h ? 0 : spec.b.length }); if (!r.netOk || r.bounces.length < spec.b.length) continue;
+    let e = 0; spec.b.forEach((bx, k) => { e += (r.bounces[k].p[0] - bx) ** 2; if (spec.bz) e += (r.bounces[k].p[2] - spec.bz[k]) ** 2; });
+    if (spec.h) { const i = r.pts.findIndex(q => (spec.h[0] < 0 ? q[0] < spec.h[0] : q[0] > spec.h[0])); e += i > 0 ? (r.pts[i][1] - spec.h[1]) ** 2 : 9; }
+    if (spec.speed) e += 0.001 * (Math.hypot(vx, vy, vz) - spec.speed) ** 2;
+    if (!best || e < best.e) best = { e, v: [vx, vy, vz] };
+  }
+  return best.v;
+}
+
+// ===================== THE RALLY: each shot starts exactly where the last one is when the paddle meets it =====================
+const W_SERVE = 2600, W_LOOP = 4000, W_SMASH = 800, W_D2 = 2200, W_D3 = 2500;
+const T_SERVE = 2.3;
+const S0 = [-1.62, 0.9, 0.32];
+const topspin = (rpm, dir) => [0, 0, -dir * rpm / RPM]; // dir = +1 when the ball flies toward +x
+// the hitter meets the ball after it bounces on his side: when it reaches his contact zone or starts to drop
+function hitTime(P, side, hitX, hMax) { const b = P.bounces.find(b => Math.sign(b.p[0]) === side); const tb = b ? b.t : 0; let prev = P.at(tb).y;
+  for (let t = tb + 0.01; t < P.end; t += 0.002) { const q = P.at(t); if (side * q.x > hitX || (q.y < prev && q.y < hMax)) return t; prev = q.y; } return tb + 0.25; }
+const vServe = solve(S0, [0, W_SERVE / RPM, 0], { vx: [3, 10, 0.1], vy: [-2.5, 1.5, 0.1], vz: -0.55, b: [-0.75, 0.85] });
+const SERVE = sim(S0, vServe, [0, W_SERVE / RPM, 0]), SERVE0 = sim(S0, vServe, [0, 0, 0]);
+// shot 2: CR-9 drives the serve back to FOXIK's forehand
+const t2 = hitTime(SERVE, 1, 1.5, 0.95), P2 = SERVE.at(t2), T_H2 = T_SERVE + t2;
+const v2 = solve(P2.toArray(), topspin(W_D2, -1), { vx: [-16, -6, 0.2], vy: [-2, 3, 0.1], vz: [-0.4, 1.2, 0.1], b: [-0.85], bz: [0.35], speed: 11 });
+const DRIVE2 = sim(P2.toArray(), v2, topspin(W_D2, -1));
+// shot 3: FOXIK drives it cross court to CR-9's forehand
+const t3 = hitTime(DRIVE2, -1, 1.5, 0.95), P3 = DRIVE2.at(t3), T_H3 = T_H2 + t3;
+const v3 = solve(P3.toArray(), topspin(W_D3, 1), { vx: [6, 16, 0.2], vy: [-2, 3, 0.1], vz: [-1.2, 0.4, 0.1], b: [0.9], bz: [-0.4], speed: 12 });
+const DRIVE3 = sim(P3.toArray(), v3, topspin(W_D3, 1));
+// shot 4: CR-9 loops it with heavy topspin
+const tL = hitTime(DRIVE3, 1, 1.5, 0.95);
+const PL = DRIVE3.at(tL), T_LOOP = T_H3 + tL;
+const vLoop = solve([PL.x, PL.y, PL.z], [0, 0, W_LOOP / RPM], { vx: [-12, -5, 0.1], vy: [-1, 4, 0.1], vz: [-0.4, 0.8, 0.1], b: [-0.95], bz: [0.05], h: [-1.6, 1.3] });
+const LOOP = sim([PL.x, PL.y, PL.z], vLoop, [0, 0, W_LOOP / RPM]), LOOP0 = sim([PL.x, PL.y, PL.z], vLoop, [0, 0, 0]);
+const T_LB = T_LOOP + LOOP.bounces[0].t;
+const tS = (() => { const b = LOOP.bounces[0].t; let prev = LOOP.at(b).y; for (let t = b + 0.01; t < LOOP.end; t += 0.002) { const y = LOOP.at(t).y; if (y < prev && y < 1.22) return t; prev = y; } return b + 0.3; })();
+const tApex = (() => { const b = LOOP.bounces[0].t; let best = b, by = 0; for (let t = b; t < tS; t += 0.002) { const y = LOOP.at(t).y; if (y > by) { by = y; best = t; } } return best; })();
+const PS = LOOP.at(tS), T_SMASH = T_LOOP + tS;
+const vSmash = solve([PS.x + 0.01, PS.y, PS.z], [0, 0, -W_SMASH / RPM], { vx: [16, 32, 0.25], vy: [-7, 0, 0.2], vz: [-0.6, 2.4, 0.15], b: [1.0], bz: [0.5], speed: 26 });
+const SMASH = sim([PS.x + 0.01, PS.y, PS.z], vSmash, [0, 0, -W_SMASH / RPM]);
+const tPass = (() => { for (let t = 0; t < SMASH.end; t += 0.002) if (SMASH.at(t).x > 2.1) return t; return 0.3; })();
+const T_PASS = T_SMASH + tPass;
+// toss: the ball leaves the left palm and falls back onto the paddle at T_SERVE
+const T_TOSS = T_SERVE - 0.55;
+
+// numbers on screen, all from the runs above
+const kmh = v => Math.hypot(...v) * 3.6;
+const curveAt = t => Math.abs(SERVE.at(t).z - SERVE0.at(t).z) * 100;
+const MET = { serveKmh: kmh(vServe), serveCurve: curveAt(SERVE.bounces[1].t), loopKmh: kmh(vLoop), smashKmh: kmh(vSmash), d2Kmh: kmh(v2), d3Kmh: kmh(v3),
+  loopOut: (() => { if (LOOP0.bounces[0]) return 0; for (let i = 6; i < LOOP0.pts.length; i++) if (LOOP0.pts[i][1] < TH + RB && LOOP0.pts[i - 1][1] >= TH + RB) return (-TL - LOOP0.pts[i][0]) * 100; return 0; })() };
+
+// ===================== PLAYER TRACKS =====================
+const BASE = { x: -2.15, z: 0, yaw: 0, hip: 0.82, tp: -0.15, tc: -0.1, lean: 0.4, side: 0, hx: 0, hy: 0, hz: 0.25, heel: 0, footR: 0.35, footL: 0.15, elbowBack: 0.25, roll: 0.3, tilt: 0, px: 0, pz: 0,
+  gR: [0.42, 1.0, 0.3], gL: [0.38, 1.02, -0.22], fR: [-0.05, 0.06, 0.34], fL: [0.12, 0.06, -0.32], bnc: 0.7 };
+const READY = { hip: 0.82, tp: -0.15, tc: -0.1, lean: 0.4, side: 0, hx: 0, hy: 0, hz: 0.25, heel: 0, footR: 0.35, roll: 0.3, tilt: 0, gR: [0.42, 1.0, 0.3], gL: [0.38, 1.02, -0.22], fR: [-0.05, 0.06, 0.34], fL: [0.12, 0.06, -0.32], bnc: 0.7 };
+function track(base, list) { let prev = base; return list.map(([t, o]) => { prev = { ...prev, ...o }; return [t, prev]; }); }
+const smX = PS.x - 0.48, smZ = PS.z - 0.3;
+// forehand drive: coil the hips and shoulders back, paddle low behind, then swing up and across
+const DRIVE_BACK = { hip: 0.78, tp: -0.55, tc: -0.6, lean: 0.42, gR: [-0.1, 0.92, 0.5], gL: [0.4, 1.05, -0.25], roll: 0.3, bnc: 0 };
+const DRIVE_HIT = { hip: 0.8, tp: 0.15, tc: 0.25, lean: 0.4 };
+const DRIVE_FOLLOW = { hip: 0.84, tp: 0.45, tc: 0.6, lean: 0.35, gR: [0.42, 1.45, -0.08], gL: [0.25, 1.05, -0.35], roll: -0.4 };
+const ME_T = track(BASE, [
+  [0, { x: -2.05, hip: 0.86, tp: -0.7, tc: -0.55, lean: 0.3, gL: [0.3, 1.0, -0.02], gR: [-0.05, 0.98, 0.42], roll: 1.2, hz: 0.1, hy: 0.4, bnc: 0 }],
+  [T_TOSS - 0.35, {}], [T_TOSS, { gL: [0.3, 1.18, -0.02] }], [T_TOSS + 0.2, { gL: [0.25, 1.3, -0.08], hy: 0.3, hz: -0.05 }],
+  [T_SERVE - 0.2, { gR: [-0.12, 1.0, 0.5], tp: -0.8, tc: -0.7 }],
+  [T_SERVE, { tp: -0.3, tc: -0.1, roll: 0.2, gL: [0.2, 1.1, -0.25], gR: 'REACH' }],
+  [T_SERVE + 0.16, { gR: [0.5, 0.92, 0.0], tp: 0.15, tc: 0.35, roll: -0.4, hy: 0 }],
+  [T_SERVE + 0.42, { ...READY, x: -2.15 }],
+  // shot 3: forehand drive
+  [T_H3 - 0.3, { ...READY, x: P3.x - 0.48, z: P3.z - 0.3, bnc: 0 }],
+  [T_H3 - 0.12, { ...DRIVE_BACK }], [T_H3, { ...DRIVE_HIT, gR: 'REACH' }], [T_H3 + 0.14, { ...DRIVE_FOLLOW }],
+  [T_H3 + 0.42, { ...READY }],
+  [T_LB - 0.05, { ...READY, x: smX, z: smZ }],
+  [T_LB + 0.06, { hip: 0.8, tp: -0.55, tc: -0.6, lean: 0.18, gR: [-0.1, 1.5, 0.36], gL: [0.36, 1.5, -0.1], roll: 0.4, tilt: 0.3, hy: 0.35, hz: 0.15, elbowBack: 0.35, bnc: 0 }],
+  [T_SMASH - 0.06, { gR: [-0.16, 1.62, 0.3], tp: -0.68, tc: -0.72, gL: [0.38, 1.56, -0.08], hz: 0.1 }],
+  [T_SMASH, { tp: 0.45, tc: 0.6, lean: 0.5, heel: -0.3, footR: 1.0, gL: [-0.05, 1.05, -0.4], roll: -0.2, tilt: 0.5, hz: 0.2, hy: 0, gR: 'REACH' }],
+  [T_SMASH + 0.15, { gR: [0.3, 0.95, -0.35], tp: 0.7, tc: 0.85, lean: 0.45 }],
+  [T_SMASH + 0.7, { ...READY, heel: 0, footR: 0.35, bnc: 0.3 }],
+  [T_PASS + 0.9, { hip: 0.9, tp: 0.1, tc: 0.15, lean: 0.05, gL: [0.15, 1.95, -0.3], gR: [0.25, 1.05, 0.42], roll: 0.6, hz: -0.1, bnc: 0.5 }],
+  [T_PASS + 1.35, { gL: [0.22, 1.62, -0.3] }], [T_PASS + 1.8, { gL: [0.15, 1.98, -0.3] }], [T_PASS + 2.6, { gL: [0.18, 1.9, -0.3] }], [99, {}],
+]);
+const lX = PL.x + 0.45, lZ = PL.z + 0.3;
+const BOT_T = track({ ...BASE, x: 2.25, yaw: Math.PI, hz: 0.1 }, [
+  [0, {}], [T_SERVE, {}],
+  // shot 2: CR-9 drive
+  [T_H2 - 0.3, { x: P2.x + 0.48, z: P2.z + 0.3, bnc: 0 }],
+  [T_H2 - 0.12, { ...DRIVE_BACK }], [T_H2, { ...DRIVE_HIT, gR: 'REACH' }], [T_H2 + 0.14, { ...DRIVE_FOLLOW }],
+  [T_H2 + 0.4, { ...READY, hz: 0.1 }],
+  [T_LOOP - 0.32, { x: lX, z: lZ }],
+  [T_LOOP - 0.18, { x: lX, z: lZ, hip: 0.78, tp: -0.5, tc: -0.6, lean: 0.4, gR: [-0.15, 0.8, 0.45], roll: 0.2, bnc: 0 }],
+  [T_LOOP, { tp: 0.1, tc: 0.2, roll: -0.3, gR: 'REACH' }],
+  [T_LOOP + 0.15, { gR: [0.55, 1.62, 0.12], tp: 0.5, tc: 0.6, lean: 0.25, hip: 0.86, roll: -0.6 }],
+  [T_LOOP + 0.6, { ...READY, x: 2.25, z: 0, hz: 0.1 }],
+  [T_SMASH, { bnc: 0 }],
+  [T_SMASH + 0.14, { z: 0.15, lean: 0.55, hip: 0.7, side: -0.2, gL: [0.5, 0.85, -0.75], fL: [0.2, 0.06, -0.55] }],
+  [T_PASS + 0.7, { ...READY, z: 0.05, hz: 0.35, hx: 0.15, lean: 0.25, bnc: 0 }], [99, {}],
+]);
+// paddle face at contact: it points along the ball's new flight, closed (tilted down) for topspin
+const faceOf = (v, close) => V(...v).normalize().add(V(0, -close, 0)).normalize();
+const HITS = [
+  { F: 'me', t: T_SERVE, C: V(...S0), n: faceOf(vServe, 0.25) }, { F: 'bot', t: T_H2, C: P2, n: faceOf(v2, 0.5) }, { F: 'me', t: T_H3, C: P3, n: faceOf(v3, 0.5) },
+  { F: 'bot', t: T_LOOP, C: PL, n: faceOf(vLoop, 0.75) }, { F: 'me', t: T_SMASH, C: PS, n: faceOf(vSmash, 0.25) }];
+function faceAt(who, s) { let best = null, w = 0; for (const h of HITS) { if (h.F !== who) continue; const k = 1 - smooth(Math.abs(s - h.t) / 0.2); if (k > w) { w = k; best = h.n; } } return [best, w]; }
+function reachKey(F, trk, h) {
+  const key = trk.find(k => k[0] === h.t)[1]; key.gR = [0.4, 1.0, 0.2];
+  const target = h.C.clone().addScaledVector(h.n, -(RB + 0.006)); // paddle centre sits just behind the ball, on the far side of the flight
+  for (let k = 0; k < 8; k++) { posePlayer(F, { ...key, face: h.n, faceW: 1 }); const err = target.clone().sub(paddleCenter(F)).applyQuaternion(F.root.quaternion.clone().invert()); key.gR = [key.gR[0] + err.x, key.gR[1] + err.y, key.gR[2] + err.z]; }
+  posePlayer(F, { ...key, face: h.n, faceW: 1 }); return target.distanceTo(paddleCenter(F));
+}
+// feet stay planted on the floor and step when the body moves away from them
+const FOOT = {};
+function footTable(trk, yaw) {
+  const dt = 1 / 200, T = 30, c = Math.cos(yaw), sn = Math.sin(yaw), STEP = 0.15;
+  const want = t => { const p = spline(trk, t); return [p.fR, p.fL].map(l => [p.x + l[0] * c + l[2] * sn, 0.06, p.z - l[0] * sn + l[2] * c]); };
+  let planted = want(0), step = null, lastEnd = -1; const tab = [];
+  for (let t = 0; t <= T; t += dt) {
+    const d = want(t + 0.06);
+    if (!step) { const e = d.map((q, k) => Math.hypot(q[0] - planted[k][0], q[2] - planted[k][2])), k = e[0] >= e[1] ? 0 : 1; if (e[k] > 0.08 && t - lastEnd > 0.015) step = { k, t0: t, from: planted[k].slice() }; }
+    const cur = planted.map(q => q.slice());
+    if (step) { const u = (t - step.t0) / STEP, to = want(step.t0 + STEP + 0.06)[step.k];
+      if (u >= 1) { planted[step.k] = to; cur[step.k] = to.slice(); step = null; lastEnd = t; }
+      else { const e = smooth(u); cur[step.k] = [lerp(step.from[0], to[0], e), 0.06 + Math.sin(Math.PI * u) * 0.07, lerp(step.from[2], to[2], e)]; } }
+    tab.push(cur);
+  }
+  return s => { const f = clamp(s / dt, 0, tab.length - 1), i = Math.floor(f), j = Math.min(tab.length - 1, i + 1), u = f - i; return [0, 1].map(k => [0, 1, 2].map(a => lerp(tab[i][k][a], tab[j][k][a], u))); };
+}
+// Catmull-Rom through the keys
+function spline(trk, s) {
+  let i = 0; while (i < trk.length - 2 && s > trk[i + 1][0]) i++;
+  const k0 = trk[Math.max(0, i - 1)], k1 = trk[i], k2 = trk[i + 1], k3 = trk[Math.min(trk.length - 1, i + 2)], t1 = k1[0], t2 = k2[0], u = clamp((s - t1) / (t2 - t1));
+  const h00 = 2 * u ** 3 - 3 * u ** 2 + 1, h10 = u ** 3 - 2 * u ** 2 + u, h01 = -2 * u ** 3 + 3 * u ** 2, h11 = u ** 3 - u ** 2;
+  const f = (a0, a1, a2, a3) => { const m1 = (a2 - a0) / Math.max(1e-6, t2 - k0[0]) * (t2 - t1), m2 = (a3 - a1) / Math.max(1e-6, k3[0] - t1) * (t2 - t1); return h00 * a1 + h10 * m1 + h01 * a2 + h11 * m2; };
+  const out = {};
+  for (const key of Object.keys(k1[1])) { const v1 = k1[1][key]; if (Array.isArray(v1)) out[key] = v1.map((_, j) => f(k0[1][key][j], v1[j], k2[1][key][j], k3[1][key][j])); else out[key] = f(k0[1][key], v1, k2[1][key], k3[1][key]); }
+  return out;
+}
+function poseAll(s) {
+  const pm = spline(ME_T, s), pb = spline(BOT_T, s);
+  pm.hip += pm.bnc * 0.014 * Math.sin(2 * Math.PI * 1.8 * s); pb.hip += pb.bnc * 0.014 * Math.sin(2 * Math.PI * 1.8 * s + 1.7);
+  pm.yaw = 0; pb.yaw = Math.PI;
+  if (FOOT.me) { pm.fw = FOOT.me(s); pb.fw = FOOT.bot(s); }
+  [pm.face, pm.faceW] = faceAt('me', s); [pb.face, pb.faceW] = faceAt('bot', s);
+  posePlayer(ME, pm); posePlayer(BOT, pb);
+}
+let TOSS = null;
+function ballAt(s) {
+  if (s < T_TOSS) { poseAll(s); return ME['gl-1'].localToWorld(V(0, 0.06, 0.035)); }
+  if (s < T_SERVE) { const u = s - T_TOSS, Tf = T_SERVE - T_TOSS, k = u / Tf; return V(lerp(TOSS.x, S0[0], k), TOSS.y + TOSS.vy * u - 4.905 * u * u, lerp(TOSS.z, S0[2], k)); }
+  if (s < T_H2) return SERVE.at(s - T_SERVE);
+  if (s < T_H3) return DRIVE2.at(s - T_H2);
+  if (s < T_LOOP) return DRIVE3.at(s - T_H3);
+  if (s < T_SMASH) return LOOP.at(s - T_LOOP);
+  return SMASH.at(s - T_SMASH);
+}
+
+// ===================== SLOW MOTION: video time → match time =====================
+const DUR = 15, FPS = 30;
+const SLOW = [[T_SERVE - 0.04, T_H2 - 0.1, 0.3], [T_H2 - 0.1, T_LOOP - 0.1, 0.6], [T_LOOP - 0.06, T_LOOP + 0.05, 0.22], [T_LB - 0.02, T_SMASH - 0.03, 0.17], [T_SMASH - 0.03, T_SMASH + 0.04, 0.07], [T_SMASH + 0.04, T_PASS + 0.25, 0.35]];
+const rate = s => { let r = 1; for (const [a, b, k] of SLOW) { const e = 0.03, w = smooth((s - a + e) / e) * (1 - smooth((s - b) / e)); r = Math.min(r, lerp(1, k, w)); } return r; };
+const MAP = (() => { const ds = 0.0005, sv = [0], vv = [0]; let s = 0, v = 0; while (v < DUR + 0.1) { v += ds / rate(s + ds / 2); s += ds; sv.push(s); vv.push(v); } return { sv, vv }; })();
+function sOf(v) { const a = MAP.vv; let lo = 0, hi = a.length - 1; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (a[m] < v) lo = m; else hi = m; } const k = (v - a[lo]) / Math.max(1e-9, a[hi] - a[lo]); return lerp(MAP.sv[lo], MAP.sv[hi], k); }
+function vOf(s) { const a = MAP.sv; let lo = 0, hi = a.length - 1; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (a[m] < s) lo = m; else hi = m; } return MAP.vv[lo]; }
+
+// ===================== CAMERA: one camera, no cuts =====================
+const CAM_T = track({ p: [-5.0, 2.2, 1.3], t: [-1.7, 1.0, 0.1], fov: 40 }, [
+  [0, {}], [T_TOSS - 0.4, { p: [-4.9, 2.15, 1.15], t: [-1.7, 1.02, 0.1] }],
+  [T_SERVE, { p: [-5.9, 2.85, 0.65], t: [0.2, 0.74, 0], fov: 36 }],
+  [T_H2, { p: [-6.0, 2.9, 0.55], t: [0.3, 0.74, 0.05], fov: 36 }],
+  [T_H3, { p: [-6.1, 2.95, 0.4], t: [0.2, 0.74, 0.05], fov: 36 }],
+  [T_LOOP, { p: [-6.1, 2.95, 0.45], t: [0.3, 0.74, 0], fov: 36 }],
+  [T_LB, { p: [-5.6, 2.6, 0.9], t: [-0.4, 0.8, 0], fov: 38 }],
+  [T_LB + 0.05, { p: [-3.0, 2.2, 2.9], t: [-1.4, 1.0, 0.05], fov: 44 }],
+  [T_LB + 0.11, { p: [-0.75, 1.32, 2.75], t: [smX + 0.15, 1.08, smZ + 0.1], fov: 48 }],
+  [T_SMASH - 0.01, { p: [-0.95, 1.36, 2.8], t: [smX + 0.2, 1.1, smZ + 0.1], fov: 48 }],
+  [T_SMASH + 0.16, { p: [-4.6, 2.25, 1.25], t: [0.4, 0.9, 0], fov: 40 }],
+  [T_PASS + 0.6, { p: [-6.3, 3.05, 0.35], t: [0.6, 0.76, 0], fov: 36 }],
+  [T_PASS + 4, { p: [-6.6, 3.2, 0.3], t: [0.6, 0.76, 0], fov: 36 }], [99, {}],
+]);
+function placeCamera(s) { const c = spline(CAM_T, s); camera.position.set(...c.p); camera.lookAt(...c.t); camera.fov = c.fov; camera.updateProjectionMatrix(); }
+
+// ===================== HUD =====================
+function toScreen(p) { const q = p.clone().project(camera); return { x: (q.x + 1) / 2 * W, y: (1 - q.y) / 2 * H }; }
+function popIn(v, v0, len) { const u = v - v0; if (u < 0 || u > len) return [0, 1]; return [Math.min(clamp(u / 0.08), clamp((len - u) / 0.2)), 1 + 0.4 * (1 - easeOut(u / 0.14))]; }
+function arcade(text, x, y, size, rot, a = 1, sc = 1) {
+  if (a <= 0) return; ctx.save(); ctx.globalAlpha = a; ctx.translate(x, y); ctx.rotate(rot); ctx.scale(sc, sc); ctx.font = `italic 900 ${size}px ${SANS}`; ctx.textAlign = 'center'; ctx.lineJoin = 'round';
+  const w = ctx.measureText(text).width; if (w > W - 80) { const k = (W - 80) / w; ctx.scale(k, k); }
+  for (let k = 8; k > 0; k--) { ctx.fillStyle = k > 2 ? '#7a0010' : '#3a0008'; ctx.fillText(text, k * 1.4, k * 1.8); }
+  ctx.lineWidth = size * 0.14; ctx.strokeStyle = '#111'; ctx.strokeText(text, 0, 0);
+  const gr = ctx.createLinearGradient(0, -size * 0.8, 0, size * 0.1); gr.addColorStop(0, '#fff7b0'); gr.addColorStop(0.45, '#ffc21a'); gr.addColorStop(1, '#ff3c00'); ctx.fillStyle = gr; ctx.fillText(text, 0, 0);
+  ctx.lineWidth = 2.5; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.strokeText(text, 0, 0); ctx.restore();
+}
+function scoreboard(a, b, serve, pop) {
+  const x = 40, y = 40, w = 430, rh = 58; ctx.save(); ctx.beginPath(); ctx.roundRect(x, y, w, rh * 2 + 40, 14); ctx.fillStyle = 'rgba(5,9,24,0.85)'; ctx.fill(); ctx.strokeStyle = 'rgba(143,180,255,0.45)'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.font = `700 18px ${MONO}`; ctx.fillStyle = '#8fb4ff'; ctx.textAlign = 'left'; ctx.fillText('GAME 5 · DECIDER', x + 20, y + 28);
+  [['FOXIK', '#ff4a10', 2, a, serve === 'me'], ['CR-9', '#e8ecf2', 2, b, serve === 'bot']].forEach(([nm, col, g, pt, sv], k) => {
+    const yy = y + 40 + k * rh; ctx.fillStyle = col; ctx.fillRect(x + 20, yy + 12, 10, 34);
+    ctx.font = `italic 900 34px ${SANS}`; ctx.fillStyle = '#fff'; ctx.fillText(nm, x + 44, yy + 42);
+    if (sv) { ctx.beginPath(); ctx.arc(x + 200, yy + 30, 7, 0, Math.PI * 2); ctx.fillStyle = '#ffc21a'; ctx.fill(); }
+    ctx.font = `700 30px ${MONO}`; ctx.textAlign = 'center'; ctx.fillStyle = '#8b94a0'; ctx.fillText(String(g), x + w - 120, yy + 41);
+    const s = k === 0 ? pop : 1; ctx.save(); ctx.translate(x + w - 53, yy + 29); ctx.scale(s, s); ctx.beginPath(); ctx.roundRect(-33, -23, 66, 46, 8); ctx.fillStyle = '#ffc21a'; ctx.fill(); ctx.fillStyle = '#111'; ctx.font = `900 32px ${MONO}`; ctx.fillText(String(pt), 0, 12); ctx.restore(); ctx.textAlign = 'left';
+  }); ctx.restore();
+}
+function tag(lines, s, bx, by, a) {
+  if (a <= 0) return; ctx.save(); ctx.globalAlpha = a; ctx.font = `700 32px ${MONO}`; const w = Math.max(...lines.map(l => ctx.measureText(l).width)) + 48, h = lines.length * 44 + 22; if (bx < 0) bx = W + bx - w;
+  ctx.strokeStyle = '#ffc21a'; ctx.lineWidth = 3; if (s) { ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(clamp(s.x, bx, bx + w), clamp(s.y, by, by + h)); ctx.stroke(); }
+  ctx.beginPath(); ctx.roundRect(bx, by, w, h, 12); ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fill(); ctx.stroke();
+  lines.forEach((l, k) => { ctx.font = k ? `400 30px ${MONO}` : `700 32px ${MONO}`; ctx.fillStyle = k ? '#fff' : '#ffc21a'; ctx.fillText(l, bx + 24, by + 50 + k * 44); }); ctx.restore();
+}
+function statLine(t, a) { if (a <= 0) return; ctx.save(); ctx.globalAlpha = a; ctx.font = `700 28px ${MONO}`; const w = ctx.measureText(t).width + 44; ctx.beginPath(); ctx.roundRect(W / 2 - w / 2, H - 196, w, 56, 10); ctx.fillStyle = 'rgba(0,0,0,0.75)'; ctx.fill(); ctx.strokeStyle = '#ffc21a'; ctx.lineWidth = 2; ctx.stroke(); ctx.textAlign = 'center'; ctx.fillStyle = '#fff'; ctx.fillText(t, W / 2, H - 158); ctx.restore(); }
+function polyline(pts, style) { if (pts.length < 2) return; const s = pts.map(toScreen); ctx.save(); ctx.beginPath(); s.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); Object.assign(ctx, style); if (style.dash) ctx.setLineDash(style.dash); ctx.lineCap = ctx.lineJoin = 'round'; ctx.stroke(); ctx.restore(); }
+const slice = (P, t0, t1) => { const out = []; for (let t = t0; t <= t1; t += 0.004) out.push(P.at(t)); out.push(P.at(t1)); return out; };
+function spinTrail(pts, a = 1) { polyline(pts, { strokeStyle: `rgba(255,120,30,${0.28 * a})`, lineWidth: 18 }); polyline(pts, { strokeStyle: `rgba(255,190,60,${0.8 * a})`, lineWidth: 8 }); polyline(pts, { strokeStyle: `rgba(255,255,255,${a})`, lineWidth: 3 }); }
+function ghostTrail(pts, a = 1) { polyline(pts, { strokeStyle: `rgba(200,225,255,${0.75 * a})`, lineWidth: 3.5, dash: [16, 12] }); const e = toScreen(pts[pts.length - 1]); ctx.save(); ctx.globalAlpha = a; ctx.beginPath(); ctx.arc(e.x, e.y, 11, 0, Math.PI * 2); ctx.strokeStyle = 'rgba(200,225,255,0.9)'; ctx.lineWidth = 3; ctx.setLineDash([5, 5]); ctx.stroke(); ctx.setLineDash([]);
+  ctx.font = `700 24px ${MONO}`; ctx.fillStyle = 'rgba(200,225,255,0.95)'; ctx.fillText('no spin', e.x + 16, e.y + 36); ctx.restore(); }
+function ballGlow(s, r = 24) { const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r); g.addColorStop(0, 'rgba(255,255,255,0.95)'); g.addColorStop(0.35, 'rgba(255,220,150,0.6)'); g.addColorStop(1, 'rgba(255,160,60,0)'); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, Math.PI * 2); ctx.fill(); }
+function spinGlyph(s, a, rot) { if (a <= 0) return; ctx.save(); ctx.globalAlpha = a; ctx.strokeStyle = '#ffc21a'; ctx.fillStyle = '#ffc21a'; ctx.lineWidth = 6; ctx.lineCap = 'round';
+  for (const off of [0, Math.PI]) { const a0 = rot + off, r = 58; ctx.beginPath(); ctx.arc(s.x, s.y, r, a0, a0 + 2.0); ctx.stroke(); const an = a0 + 2.0, hx = s.x + Math.cos(an) * r, hy = s.y + Math.sin(an) * r, tx = -Math.sin(an), ty = Math.cos(an);
+    ctx.beginPath(); ctx.moveTo(hx + tx * 18, hy + ty * 18); ctx.lineTo(hx - ty * 12, hy + tx * 12); ctx.lineTo(hx + ty * 12, hy - tx * 12); ctx.closePath(); ctx.fill(); } ctx.restore(); }
+function burst(x, y, r, a) { if (a <= 0) return; ctx.save(); ctx.globalAlpha = a; ctx.translate(x, y); const n = 16; ctx.beginPath(); for (let k = 0; k < n * 2; k++) { const an = k / (n * 2) * Math.PI * 2, rr = k % 2 ? r * 0.45 : r * (0.85 + 0.3 * ((k * 7) % 5) / 5); ctx[k ? 'lineTo' : 'moveTo'](Math.cos(an) * rr, Math.sin(an) * rr); } ctx.closePath();
+  ctx.fillStyle = '#fff6c8'; ctx.fill(); ctx.lineWidth = 5; ctx.strokeStyle = '#111'; ctx.stroke(); ctx.beginPath(); ctx.arc(0, 0, r * 0.3, 0, Math.PI * 2); ctx.fillStyle = '#ffc21a'; ctx.fill(); ctx.restore();
+  ctx.save(); ctx.globalAlpha = a; ctx.lineCap = 'round'; let sd = 3; const r2 = () => (sd = (sd * 16807) % 2147483647, (sd - 1) / 2147483646); for (let k = 0; k < 40; k++) { const an = r2() * Math.PI * 2, r0 = r * 1.1 + r2() * 40, r1 = r0 + 120 + r2() * 260; ctx.strokeStyle = `rgba(255,255,255,${0.3 + r2() * 0.5})`; ctx.lineWidth = 2 + r2() * 4; ctx.beginPath(); ctx.moveTo(x + Math.cos(an) * r0, y + Math.sin(an) * r0); ctx.lineTo(x + Math.cos(an) * r1, y + Math.sin(an) * r1); ctx.stroke(); } ctx.restore(); }
+function pill(t, y, a) { if (a <= 0) return; ctx.save(); ctx.globalAlpha = a; ctx.font = `700 28px ${MONO}`; const w = ctx.measureText(t).width + 48; ctx.beginPath(); ctx.roundRect(W / 2 - w / 2, y, w, 58, 29); ctx.fillStyle = '#fff'; ctx.fill(); ctx.textAlign = 'center'; ctx.fillStyle = '#111'; ctx.fillText(t, W / 2, y + 39); ctx.restore(); }
+function summary(a) {
+  if (a <= 0) return; const rows = [['fastest ball', `${Math.round(MET.smashKmh)} km/h`], ['most spin', `${W_LOOP.toLocaleString('en-US')} rpm`], ['biggest curve', `${Math.round(MET.serveCurve)} cm`]];
+  const w = 660, h = 84 + rows.length * 58, x = W / 2 - w / 2, y = 955; ctx.save(); ctx.globalAlpha = a; ctx.beginPath(); ctx.roundRect(x, y, w, h, 16); ctx.fillStyle = 'rgba(4,8,22,0.86)'; ctx.fill(); ctx.strokeStyle = '#ffc21a'; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.font = `700 26px ${MONO}`; ctx.fillStyle = '#ffc21a'; ctx.fillText('MATCH POINT STATS', x + 30, y + 46);
+  rows.forEach(([l, r], k) => { const yy = y + 100 + k * 58; ctx.font = `400 30px ${MONO}`; ctx.fillStyle = '#c9d3e6'; ctx.textAlign = 'left'; ctx.fillText(l, x + 30, yy); ctx.font = `700 34px ${MONO}`; ctx.fillStyle = '#fff'; ctx.textAlign = 'right'; ctx.fillText(r, x + w - 30, yy); }); ctx.restore();
+}
+const fadeWin = (s, a, b, fi = 0.05, fo = 0.08) => Math.min(clamp((s - a) / fi), clamp((b - s) / fo));
+function hud(v, s) {
+  const vS = vOf(T_SMASH);
+  if (v >= vS && v < vS + 2.5 / FPS) { ctx.save(); ctx.filter = 'grayscale(1) contrast(4) invert(1)'; ctx.drawImage(out, 0, 0); ctx.restore(); }
+  const vg = ctx.createRadialGradient(W / 2, H * 0.45, H * 0.25, W / 2, H * 0.5, H * 0.8); vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.5)'); ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
+  const bp = ballAt(s); poseAll(s); const bs = toScreen(bp);
+  // serve: real path with spin, dashed path of the same serve without spin
+  if (s >= T_SERVE && s < T_H2 + 0.3) { const u = Math.min(s, T_H2) - T_SERVE, a = fadeWin(s, T_SERVE, T_H2 + 0.3, 0.02, 0.25); const u0 = Math.min(u, SERVE.bounces[1].t + 0.05);
+    ghostTrail(slice(SERVE0, 0, u0), a); spinTrail(slice(SERVE, 0, u), a); }
+  if (s >= T_LOOP && s < T_LB + 0.15) { const u = Math.min(s, T_SMASH) - T_LOOP, a = fadeWin(s, T_LOOP, T_LB + 0.15, 0.02, 0.1); ghostTrail(slice(LOOP0, 0, Math.min(u, LOOP0.end)), a); spinTrail(slice(LOOP, 0, u), a); }
+  if (s >= T_LB && s < T_SMASH) spinTrail(slice(LOOP, Math.max(LOOP.bounces[0].t, s - T_LOOP - 0.15), s - T_LOOP), 0.9);
+  if (s >= T_SMASH && s < T_PASS + 0.6) { const u = s - T_SMASH; spinTrail(slice(SMASH, Math.max(0, u - 0.09), u), fadeWin(s, T_SMASH, T_PASS + 0.6, 0.01, 0.3)); }
+  // fast exchanges: a short streak behind the ball so it reads on a phone
+  if (s >= T_H2 + 0.02 && s < T_LOOP) { const pts = []; for (let k = 0; k <= 14; k++) { const t = s - k * 0.006; if (t < T_H2) break; pts.push(ballAt(t)); } spinTrail(pts, 0.75); }
+  if (s > T_TOSS - 0.1) ballGlow(bs, s > T_LB && s < T_SMASH ? 36 : 24);
+  // numbers next to the ball, read live from the simulation
+  { const a = fadeWin(s, T_SERVE + 0.03, T_H2 + 0.06, 0.05, 0.1), u = Math.min(s, T_H2) - T_SERVE; const c = Math.min(curveAt(Math.min(u, SERVE.bounces[1].t)), MET.serveCurve);
+    tag(['SIDESPIN', `${W_SERVE.toLocaleString('en-US')} rpm`, `${Math.round(MET.serveKmh)} km/h`, `curves ${Math.round(c)} cm`], bs, 40, 236, a); }
+  { const a = fadeWin(s, T_LOOP + 0.02, T_LB + 0.06, 0.04, 0.08); tag(['TOPSPIN', `${W_LOOP.toLocaleString('en-US')} rpm`, `${Math.round(MET.loopKmh)} km/h`, `no spin: out by ${Math.round(MET.loopOut)} cm`], bs, 40, 236, a); }
+  { const a = fadeWin(s, T_LB + 0.06, T_SMASH - 0.005, 0.03, 0.01), u = clamp(s - T_LOOP, 0, tS); const r = Math.round(LOOP.rpmAt(u) / 10) * 10;
+    spinGlyph(bs, a, v * 2.2); tag([`${r.toLocaleString('en-US')} rpm`, `ball ${Math.round(LOOP.speedAt(u) * 3.6)} km/h`], bs, -40, 236, a); }
+  { const r = rate(s); statLine(`slow motion ${r.toFixed(2)}x`, s > T_LB + 0.04 && s < T_SMASH - 0.02 ? 1 : 0); }
+  { const u = v - vS; burst(toScreen(PS).x, toScreen(PS).y, 110, u >= 0 && u < 0.6 ? 1 - u / 0.6 : 0); }
+  const tg = ctx.createLinearGradient(0, 0, 0, 240); tg.addColorStop(0, 'rgba(0,0,0,0.6)'); tg.addColorStop(1, 'rgba(0,0,0,0)'); ctx.fillStyle = tg; ctx.fillRect(0, 0, W, 240);
+  { const n = HITS.filter(h => s >= h.t).length; if (n > 0) { const hv = HITS[n - 1].t, [ra, rp] = popIn(v, vOf(hv), 99); ctx.save(); ctx.translate(W - 60, 92); ctx.scale(rp, rp); ctx.textAlign = 'right'; ctx.font = `700 22px ${MONO}`; ctx.fillStyle = '#8fb4ff'; ctx.fillText('RALLY', 0, -34);
+    ctx.font = `italic 900 64px ${SANS}`; ctx.lineWidth = 8; ctx.strokeStyle = '#111'; ctx.lineJoin = 'round'; ctx.strokeText(String(n), 0, 26); ctx.fillStyle = '#fff'; ctx.fillText(String(n), 0, 26); ctx.restore(); } }
+  const vP = vOf(T_PASS); const [pa, pp] = popIn(v, vP, 99); scoreboard(v >= vP ? 11 : 10, 10, v >= vP ? null : 'me', v >= vP ? pp : 1);
+  let a, p;
+  [a, p] = popIn(v, 0.25, T_TOSS - 0.45); arcade('MATCH POINT', W / 2, 1090, 150, -0.04, a, p);
+  [a, p] = popIn(v, vS, 1.5); arcade('SMASH!', W / 2 + 40, 345, 170, -0.07, a, p);
+  statLine(`smash · ${Math.round(MET.smashKmh)} km/h`, v >= vS && v < vS + 2.0 ? Math.min(clamp((v - vS) / 0.1), clamp((vS + 2.0 - v) / 0.2)) : 0);
+  [a, p] = popIn(v, vP + 0.5, 99); arcade('FOXIK WINS', W / 2, 340, 150, -0.04, a, p);
+  summary(clamp((v - vP - 1.2) / 0.3)); pill('PART 4? YOU PICK', 870, clamp((v - vP - 2.0) / 0.3));
+  ctx.font = `700 22px ${MONO}`; ctx.textAlign = 'left'; ctx.beginPath(); ctx.roundRect(40, H - 108, 340, 44, 22); ctx.fillStyle = '#ff3c00'; ctx.fill(); ctx.fillStyle = '#fff'; ctx.fillText('PART 3 · TABLE TENNIS', 60, H - 79);
+  ctx.font = `400 18px ${MONO}`; ctx.textAlign = 'right'; ctx.fillStyle = '#8b94a0'; ctx.fillText('simulation, not a real match · built by Opus 5.5', W - 40, H - 80); ctx.textAlign = 'left';
+}
+
+// ===================== RENDER =====================
+const composer = new EffectComposer(renderer); composer.setSize(W, H);
+composer.addPass(new RenderPass(scene, camera));
+const ao = new GTAOPass(scene, camera, W, H); ao.updateGtaoMaterial({ radius: 0.12, distanceExponent: 1.5, thickness: 1.5, scale: 1.0, samples: 16 }); ao.blendIntensity = 1.0; composer.addPass(ao);
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(W, H), 0.45, 0.45, 2.0));
+composer.addPass(new OutputPass());
+function draw(v) {
+  v = clamp(v, 0, DUR - 0.001); const s = sOf(v); const bp = ballAt(s); poseAll(s); BALL.position.copy(bp); BALL.visible = s < T_SMASH + SMASH.end; placeCamera(s); scene.updateMatrixWorld(true);
+  composer.render(); ctx.drawImage(renderer.domElement, 0, 0); hud(v, s);
+}
+window.__draw = draw;
+let REACH_ERR = {};
+window.__cal = () => ({ parts: N_PARTS, ...MET, serveRpm: W_SERVE, loopRpm: W_LOOP, apexRpm: LOOP.rpmAt(tApex), apexKmh: LOOP.speedAt(tApex) * 3.6, reachErr: REACH_ERR,
+  T: { toss: T_TOSS, serve: T_SERVE, h2: T_H2, h3: T_H3, loop: T_LOOP, lb: T_LB, smash: T_SMASH, pass: T_PASS }, V: { serve: vOf(T_SERVE), loop: vOf(T_LOOP), lb: vOf(T_LB), smash: vOf(T_SMASH), pass: vOf(T_PASS), end: sOf(DUR) },
+  PL: PL.toArray(), PS: PS.toArray(), smashBounce: SMASH.bounces[0]?.p, loopBounce: LOOP.bounces[0]?.p, serveBounces: SERVE.bounces.map(b => b.p) });
+let recording = false, t0 = performance.now();
+async function renderMp4() {
+  const status = document.getElementById('status'), btn = document.getElementById('rec'); recording = true; btn.disabled = true;
+  const target = new Mp4Muxer.ArrayBufferTarget(), muxer = new Mp4Muxer.Muxer({ target, video: { codec: 'avc', width: W, height: H }, fastStart: 'in-memory' });
+  const enc = new VideoEncoder({ output: (ch, m) => muxer.addVideoChunk(ch, m), error: e => { status.textContent = 'Error: ' + e.message; } });
+  enc.configure({ codec: 'avc1.640028', width: W, height: H, bitrate: 16e6, framerate: FPS }); const NF = FPS * DUR;
+  for (let i = 0; i < NF; i++) { draw(i / FPS); const f = new VideoFrame(out, { timestamp: Math.round(i * 1e6 / FPS), duration: Math.round(1e6 / FPS) }); enc.encode(f, { keyFrame: i % FPS === 0 }); f.close();
+    if (enc.encodeQueueSize > 6) await new Promise(res => setTimeout(res, 5)); if (i % 10 === 0) { status.textContent = 'Rendering ' + Math.round(i / NF * 100) + '%'; await new Promise(res => setTimeout(res, 0)); } }
+  await enc.flush(); muxer.finalize(); const buf = target.buffer; let saved = false;
+  try { saved = (await fetch('/save?name=table-tennis.mp4', { method: 'POST', body: buf })).ok; } catch (e) {}
+  if (!saved) { const a = document.createElement('a'); a.download = 'table-tennis.mp4'; a.href = URL.createObjectURL(new Blob([buf], { type: 'video/mp4' })); a.click(); }
+  status.textContent = 'Done: ' + (buf.byteLength / 1e6).toFixed(1) + ' MB' + (saved ? ' (saved)' : ''); window.__done = { bytes: buf.byteLength, saved }; recording = false; btn.disabled = false;
+}
+window.renderMp4 = renderMp4;
+// ---------- spin lab: same sim() as the rally, one serve launched with the same velocity, you pick the spin ----------
+{
+  const kindEl = document.getElementById('lk'), rpmEl = document.getElementById('lr'), valEl = document.getElementById('lv'), infoEl = document.getElementById('li');
+  const top = document.getElementById('ltop').getContext('2d'), side = document.getElementById('lside').getContext('2d');
+  const AXIS = { side: r => [0, r / RPM, 0], top: r => [0, 0, -r / RPM], back: r => [0, 0, r / RPM] };
+  const X0 = -1.8, SC = 200; // 200 px per metre, x from -1.8 m to 2.2 m
+  const path = (c, pts, px, py, style, dash, width) => { c.save(); c.setLineDash(dash); c.strokeStyle = style; c.lineWidth = width; c.beginPath(); let started = false;
+    for (let i = 0; i < pts.length; i++) { const q = pts[i]; if (i > 0 && q[1] < RB + 0.01) break; const X = px(q), Y = py(q); if (!started) { c.moveTo(X, Y); started = true; } else c.lineTo(X, Y); } c.stroke(); c.restore(); };
+  function drawLab() {
+    const r = +rpmEl.value; valEl.textContent = r.toLocaleString('en-US') + ' rpm';
+    const a = sim(S0, vServe, AXIS[kindEl.value](r), { T: 0.9 }), b = sim(S0, vServe, [0, 0, 0], { T: 0.9 });
+    const tx = q => (q[0] - X0) * SC, tz = q => 200 + q[2] * SC, ty = q => 200 - (q[1] - 0.55) * SC;
+    top.clearRect(0, 0, 800, 400); top.fillStyle = '#1a4fa0'; top.fillRect(tx([-TL]), tz([0, 0, -TW]), 2 * TL * SC, 2 * TW * SC);
+    top.fillStyle = '#fff'; top.fillRect(tx([0]) - 1, tz([0, 0, -TW]) - 12, 2, 2 * TW * SC + 24);
+    side.clearRect(0, 0, 800, 200); side.fillStyle = '#1a4fa0'; side.fillRect(tx([-TL]), ty([0, TH]), 2 * TL * SC, 6);
+    side.fillStyle = '#fff'; side.fillRect(tx([0]) - 1, ty([0, TH + 0.1525]), 2, 0.1525 * SC);
+    for (const [c, px, py] of [[top, tx, tz], [side, tx, ty]]) { path(c, b.pts, px, py, 'rgba(200,225,255,0.9)', [8, 8], 3); path(c, a.pts, px, py, '#ff7a1a', [], 5); }
+    top.fillStyle = '#9aa3b8'; top.font = '14px sans-serif'; top.fillText('top view', 10, 22); side.fillStyle = '#9aa3b8'; side.font = '14px sans-serif'; side.fillText('side view', 10, 22);
+    const land = s => s.netOk ? s.bounces.find(q => q.p[0] > 0) : null, la = land(a), lb = land(b), lines = [];
+    lines.push(a.netOk ? 'net: clear' : 'net: with this spin the ball hits the net');
+    lines.push(!a.netOk ? 'with spin: the ball never reaches the far half' : la ? `with spin: lands ${(la.p[0] * 100).toFixed(0)} cm past the net, ${(la.p[2] * 100).toFixed(0)} cm from the centre line` : 'with spin: does not land on the far half of the table');
+    lines.push(lb ? `no spin: lands ${(lb.p[0] * 100).toFixed(0)} cm past the net, ${(lb.p[2] * 100).toFixed(0)} cm from the centre line` : 'no spin: does not land on the far half of the table');
+    if (la && lb) lines.push(`difference at landing: ${(Math.hypot(la.p[0] - lb.p[0], la.p[2] - lb.p[2]) * 100).toFixed(0)} cm`);
+    lines.push('simulation: gravity, drag and Magnus force. Spin is set by you, it is not decided by a player.');
+    infoEl.textContent = lines.join('\n');
+  }
+  kindEl.oninput = rpmEl.oninput = drawLab; window.__drawLab = drawLab; drawLab();
+}
+document.getElementById('rec').onclick = renderMp4;
+document.getElementById('play').onclick = () => { t0 = performance.now(); };
+function loop(now) { if (!recording && !window.__freeze) draw(((now - t0) / 1000) % DUR); requestAnimationFrame(loop); }
+Promise.all([document.fonts.load('italic 900 120px Inter'), document.fonts.load('700 22px "JetBrains Mono"')]).finally(() => {
+  try {
+    buildBoards();
+    HITS.forEach((h, i) => { REACH_ERR['hit' + (i + 1)] = reachKey(h.F === 'me' ? ME : BOT, h.F === 'me' ? ME_T : BOT_T, h); });
+    FOOT.me = footTable(ME_T, 0); FOOT.bot = footTable(BOT_T, Math.PI);
+    poseAll(T_TOSS); const r = ME['gl-1'].localToWorld(V(0, 0.06, 0.035)), Tf = T_SERVE - T_TOSS; TOSS = { x: r.x, y: r.y, z: r.z, vy: (S0[1] - r.y + 4.905 * Tf * Tf) / Tf };
+    document.getElementById('status').textContent = `serve ${Math.round(MET.serveKmh)} km/h · curve ${Math.round(MET.serveCurve)} cm · smash ${Math.round(MET.smashKmh)} km/h`;
+    document.getElementById('rec').disabled = false; window.__ready = true; requestAnimationFrame(loop);
+  } catch (e) { window.__ready = { err: String(e.stack || e) }; }
+});
+</script>
+</body>
+</html>
